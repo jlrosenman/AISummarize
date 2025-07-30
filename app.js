@@ -1,52 +1,57 @@
-require('dotenv').config();
-const axios = require('axios');
-const express = require('express');
-const { WebClient } = require('@slack/web-api');
+import dotenv from 'dotenv';
+import { WebClient } from '@slack/web-api';
+import axios from 'axios';
+import express from 'express';
 
-const app = express();  // <-- THIS LINE IS CRUCIAL
+dotenv.config();
+
+const app = express();
 const port = process.env.PORT || 3000;
 
 const slackClient = new WebClient(process.env.SLACK_BOT_TOKEN);
+
 const TARGET_CHANNEL_ID = process.env.TARGET_CHANNEL_ID;
 
+const DEFAULT_USER_ID = process.env.DEFAULT_USER_ID;
 const TEAM_CHANNELS = {
   team_1: process.env.TEAM_1_CHANNEL_ID,
   team_2: process.env.TEAM_2_CHANNEL_ID,
   team_3: process.env.TEAM_3_CHANNEL_ID,
 };
 
-// Middleware to parse Slack requests
+const channelInfo1 = await slackClient.conversations.info({ channel: TEAM_CHANNELS.team_1 });
+const firstChannelName = channelInfo1.channel.name;
+
+const channelInfo2 = await slackClient.conversations.info({ channel: TEAM_CHANNELS.team_2 });
+const secondChannelName = channelInfo2.channel.name;
+
+const channelInfo3 = await slackClient.conversations.info({ channel: TEAM_CHANNELS.team_3 });
+const thirdChannelName = channelInfo3.channel.name;
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// Handle /summarize slash command
+const initialMessages = {
+  '/inform': (summary) => `Hi team, we are starting the following change. Please reach out to the help-network-datacenter channel with any related alerts or issues.Thanks!\n\n${summary}`,
+  '/approval': (summary) => `Hi @person! Approval needed! Please review the attached request:\n\n${summary}`,
+};
+
 app.post('/slack/commands', async (req, res) => {
   const { command, text, user_id, channel_id } = req.body;
 
-  if (command !== '/summarize') {
+  if (!['/inform', '/approval'].includes(command)) {
     return res.status(400).send('Unsupported command.');
   }
 
   try {
-    // Send user summary text to chatbot API
-    const chatbotResponse = await axios.post(`${process.env.SPARKY_AI}/conversations/chat/`, { message: text });
-    const replyText = chatbotResponse.data.reply || 'No reply from chatbot';
-
-    // Post chatbot reply publicly to target Slack channel
-    await slackClient.chat.postMessage({
-      channel: TARGET_CHANNEL_ID,
-      text: replyText,
-    });
-
-    // Send ephemeral confirmation with a button back to user
     return res.json({
       channel: channel_id,
       user: user_id,
-      text: '✅ Your summary request has been processed and posted.',
+      text: '✅ Your request has been processed and posted.',
       blocks: [
         {
           type: 'section',
-          text: { type: 'plain_text', text: '✅ Your summary request has been processed and posted.' },
+          text: { type: 'plain_text', text: '✅ Your request has been processed and posted.' },
         },
         {
           type: 'actions',
@@ -54,21 +59,23 @@ app.post('/slack/commands', async (req, res) => {
             {
               type: 'button',
               text: { type: 'plain_text', text: '📤 Open Submit Form', emoji: true },
-              value: JSON.stringify({ summary: text, user_id }),
+              value: JSON.stringify({
+                summary: text,
+                user_id,
+                command,
+              }),
               action_id: 'open_submit_modal',
             },
           ],
         },
       ],
     });
-
   } catch (error) {
-    console.error('Error processing summary:', error);
-    return res.status(500).send('Failed to process summary.');
+    console.error('Error processing command:', error);
+    return res.status(500).send('Failed to process request.');
   }
 });
 
-// Handle interactive components (buttons + modals)
 app.post('/slack/interactions', async (req, res) => {
   let payload;
 
@@ -79,50 +86,78 @@ app.post('/slack/interactions', async (req, res) => {
     return res.sendStatus(400);
   }
 
-  // Handle "Open Submit Form" button click
   if (payload.type === 'block_actions' && payload.actions[0].action_id === 'open_submit_modal') {
     const data = JSON.parse(payload.actions[0].value);
 
     try {
+      const prepopulatedMessage = initialMessages[data.command](data.summary);
+
+      const blocks = [
+        {
+          type: 'input',
+          block_id: 'channel_select',
+          label: { type: 'plain_text', text: 'Select channels(s) to send this to:' },
+          element: {
+            type: 'multi_static_select',
+            action_id: 'channels',
+            placeholder: { type: 'plain_text', text: 'Select channels' },
+            options: data.command === '/approval'
+              ? [
+                  { text: { type: 'plain_text', text: firstChannelName }, value: TEAM_CHANNELS.team_1 },
+                  { text: { type: 'plain_text', text: secondChannelName }, value: TEAM_CHANNELS.team_2 },
+                ]
+              : [
+                  { text: { type: 'plain_text', text: firstChannelName }, value: TEAM_CHANNELS.team_1 },
+                  { text: { type: 'plain_text', text: secondChannelName }, value: TEAM_CHANNELS.team_2 },
+                  { text: { type: 'plain_text', text: thirdChannelName }, value: TEAM_CHANNELS.team_3 },
+                ],
+          },
+        },
+      ];
+
+      if (data.command === '/approval') {
+        blocks.push({
+          type: 'input',
+          block_id: 'user_select',
+          label: { type: 'plain_text', text: 'Select person(s) to @mention for approval' },
+          element: {
+            type: 'multi_users_select',
+            action_id: 'mention',
+            placeholder: { type: 'plain_text', text: 'Choose users' },
+            initial_users: [DEFAULT_USER_ID], // default user selected
+          },
+         "element":{
+          "type": "plain_text_input",
+          "action_id": "input1",
+          "placeholder":{
+            "type": "plain_text",
+            "text": "Type in here"
+          },
+          "multiline":true
+         }
+        });
+      }
+
+      blocks.push({
+        type: 'input',
+        block_id: 'message_input',
+        label: { type: 'plain_text', text: 'Message to send:' },
+        element: {
+          type: 'plain_text_input',
+          action_id: 'message',
+          multiline: true,
+          initial_value: prepopulatedMessage,
+        },
+      });
+
       await slackClient.views.open({
         trigger_id: payload.trigger_id,
         view: {
           type: 'modal',
           callback_id: 'submit_summary_modal',
-          title: { type: 'plain_text', text: 'Send to Teams' },
+          title: { type: 'plain_text', text: 'Send to Channels' },
           submit: { type: 'plain_text', text: 'Send' },
-          blocks: [
-            {
-              type: 'section',
-              text: { type: 'mrkdwn', text: `📌 *Summary from* <@${data.user_id}>:\n>${data.summary}` },
-            },
-            {
-              type: 'input',
-              block_id: 'team_select',
-              label: { type: 'plain_text', text: 'Select team(s) to send this to:' },
-              element: {
-                type: 'multi_static_select',
-                action_id: 'teams',
-                placeholder: { type: 'plain_text', text: 'Select teams' },
-                options: [
-                  { text: { type: 'plain_text', text: 'team 1' }, value: 'team_1' },
-                  { text: { type: 'plain_text', text: 'team 2' }, value: 'team_2' },
-                  { text: { type: 'plain_text', text: 'team 3' }, value: 'team_3' },
-                ],
-              },
-            },
-            {
-               type: 'input',
-              block_id: 'message_input',
-              label: { type: 'plain_text', text: 'Message to send:' },
-              element: {
-                type: 'plain_text_input',
-                action_id: 'message',
-                multiline: true,
-                initial_value: 'Hi team! Please see the below change management ticket.',
-              },
-            },
-          ],
+          blocks,
         },
       });
 
@@ -133,23 +168,35 @@ app.post('/slack/interactions', async (req, res) => {
     }
   }
 
-  // Handle modal submission
   if (payload.type === 'view_submission' && payload.view.callback_id === 'submit_summary_modal') {
     const values = payload.view.state.values;
-    const selectedTeams = values.team_select.teams.selected_options.map(opt => opt.value);
-    const message = values.message_input.message.value;
+    const selectedChannelIds = values.channel_select.teams.selected_options.map(opt => opt.value);
+    let message = values.message_input.message.value;
 
-    for (const team of selectedTeams) {
-      const channelId = TEAM_CHANNELS[team];
-      if (channelId) {
-        try {
-          await slackClient.chat.postMessage({
-            channel: channelId,
-            text: `📣 Message from <@${payload.user.id}>:\n>${message}`,
-          });
-        } catch (err) {
-          console.error(`Error sending to ${team}:`, err);
-        }
+    if ('user_select' in values && values.user_select.mention?.selected_users) {
+      const userIds = values.user_select.mention.selected_users;
+      const mentionString = userIds.map(id => `<@${id}>`).join(' ');
+
+      if (/@person/gi.test(message)) {
+        message = message.replace(/@person/gi, mentionString);
+      } else {
+        message = `${mentionString}\n\n${message}`;
+      }
+    }
+
+    console.log('Selected channels:', selectedChannelIds);
+    console.log('Message:', message);
+    console.log('User ID:', payload.user.id);
+
+    for (const channelId of selectedChannelIds) {
+      try {
+        await slackClient.chat.postMessage({
+          channel: channelId,
+          text: `📣 Message from <@${payload.user.id}>:\n${message}`,
+        });
+        console.log(`Message sent to channel ${channelId}`);
+      } catch (err) {
+        console.error(`Error sending to channel ${channelId}:`, err);
       }
     }
 
@@ -159,7 +206,6 @@ app.post('/slack/interactions', async (req, res) => {
   return res.sendStatus(200);
 });
 
-// Start server
 app.listen(port, () => {
   console.log(`✅ Slack bot server running on port ${port}`);
 });
