@@ -37,136 +37,78 @@ const initialMessages = {
 };
 
 app.post('/slack/commands', async (req, res) => {
-  const { command, text, user_id, channel_id } = req.body;
-
-  if (!['/inform', '/approval'].includes(command)) {
-    return res.status(400).send('Unsupported command.');
-  }
-
+ const { command, text, user_id, channel_id, response_url } = req.body;
+ if (!['/inform', '/approval'].includes(command)) {
+  return res.status(400).send('Unsupported command.');
+ }
+ // Respond to Slack *immediately*
+ res.status(200).send(); // :point_left: Immediate empty response to avoid Slack timeout
+ // Begin async processing AFTER response
+ let summary = text;
+ let jiraDescriptionOnly = '';
+ const jiraMatch = text.match(/([A-Z]+-\d+)/);
+ if (jiraMatch) {
+  const issueKey = jiraMatch[1];
   try {
-    return res.json({
-      channel: channel_id,
-      user: user_id,
-      text: '✅ Your request has been processed and posted.',
-      blocks: [
-        {
-          type: 'section',
-          text: { type: 'plain_text', text: '✅ Your request has been processed and posted.' },
-        },
-        {
-          type: 'actions',
-          elements: [
-            {
-              type: 'button',
-              text: { type: 'plain_text', text: '📤 Open Submit Form', emoji: true },
-              value: JSON.stringify({
-                summary: text,
-                user_id,
-                command,
-              }),
-              action_id: 'open_submit_modal',
-            },
-          ],
-        },
-      ],
-    });
-  } catch (error) {
-    console.error('Error processing command:', error);
-    return res.status(500).send('Failed to process request.');
+   const jiraRes = await axios.get(
+    `https://${process.env.JIRA_DOMAIN}/rest/api/2/issue/${issueKey}`,
+    {
+     auth: {
+      username: process.env.JIRA_USERNAME,
+      password: process.env.JIRA_PASSWORD,
+     },
+    }
+   );
+   const issue = jiraRes.data;
+   // Just store the description
+   jiraDescriptionOnly = issue.fields.description || '';
+   // :white_check_mark: Truncate it here, just in case it's too large
+   if (jiraDescriptionOnly.length > 100) {
+    jiraDescriptionOnly = jiraDescriptionOnly.substring(0, 100) + '\n...(truncated)';
+   }
+   // Send Jira info directly to user as DM
+   await slackClient.chat.postMessage({
+    channel: user_id,
+    text: `:information_source: Jira info for ${issueKey}:\n${jiraDescriptionOnly || 'No description found.'}`,
+   });
+  } catch (err) {
+   console.error(`:warning: Failed to fetch Jira ticket: ${issueKey}`, err.message);
   }
+ }
+ // Now send the interactive message to response_url (without Jira info in modal)
+ try {
+  await axios.post(response_url, {
+   response_type: 'ephemeral', // or 'in_channel'
+   blocks: [
+    {
+     type: 'section',
+     text: { type: 'plain_text', text: ':white_check_mark: Your request has been processed and posted.' },
+    },
+    {
+     type: 'actions',
+     elements: [
+      {
+       type: 'button',
+       text: { type: 'plain_text', text: ':outbox_tray: Open Submit Form', emoji: true },
+       value: JSON.stringify({
+        summary: summary, // Only raw text, no Jira info
+        user_id,
+        command,
+       }),
+       action_id: 'open_submit_modal',
+      },
+     ],
+    },
+   ],
+  });
+ } catch (error) {
+  console.error('Error posting to response_url:', error);
+ }
 });
 
+// Add a new route to handle Slack interactive events (like view_submission)
 app.post('/slack/interactions', async (req, res) => {
-  let payload;
-
-  try {
-    payload = JSON.parse(req.body.payload);
-  } catch (err) {
-    console.error('Invalid payload:', err);
-    return res.sendStatus(400);
-  }
-
-  if (payload.type === 'block_actions' && payload.actions[0].action_id === 'open_submit_modal') {
-    const data = JSON.parse(payload.actions[0].value);
-
-    try {
-      const prepopulatedMessage = initialMessages[data.command](data.summary);
-
-      const blocks = [
-        {
-          type: 'input',
-          block_id: 'channel_select',
-          label: { type: 'plain_text', text: 'Select channels(s) to send this to:' },
-          element: {
-            type: 'multi_static_select',
-            action_id: 'channels',
-            placeholder: { type: 'plain_text', text: 'Select channels' },
-            options: data.command === '/approval'
-              ? [
-                  { text: { type: 'plain_text', text: firstChannelName }, value: TEAM_CHANNELS.team_1 },
-                  { text: { type: 'plain_text', text: secondChannelName }, value: TEAM_CHANNELS.team_2 },
-                ]
-              : [
-                  { text: { type: 'plain_text', text: firstChannelName }, value: TEAM_CHANNELS.team_1 },
-                  { text: { type: 'plain_text', text: secondChannelName }, value: TEAM_CHANNELS.team_2 },
-                  { text: { type: 'plain_text', text: thirdChannelName }, value: TEAM_CHANNELS.team_3 },
-                ],
-          },
-        },
-      ];
-
-      if (data.command === '/approval') {
-        blocks.push({
-          type: 'input',
-          block_id: 'user_select',
-          label: { type: 'plain_text', text: 'Select person(s) to @mention for approval' },
-          element: {
-            type: 'multi_users_select',
-            action_id: 'mention',
-            placeholder: { type: 'plain_text', text: 'Choose users' },
-            initial_users: [DEFAULT_USER_ID], // default user selected
-          },
-         "element":{
-          "type": "plain_text_input",
-          "action_id": "input1",
-          "placeholder":{
-            "type": "plain_text",
-            "text": "Type in here"
-          },
-          "multiline":true
-         }
-        });
-      }
-
-      blocks.push({
-        type: 'input',
-        block_id: 'message_input',
-        label: { type: 'plain_text', text: 'Message to send:' },
-        element: {
-          type: 'plain_text_input',
-          action_id: 'message',
-          multiline: true,
-          initial_value: prepopulatedMessage,
-        },
-      });
-
-      await slackClient.views.open({
-        trigger_id: payload.trigger_id,
-        view: {
-          type: 'modal',
-          callback_id: 'submit_summary_modal',
-          title: { type: 'plain_text', text: 'Send to Channels' },
-          submit: { type: 'plain_text', text: 'Send' },
-          blocks,
-        },
-      });
-
-      return res.sendStatus(200);
-    } catch (err) {
-      console.error('Error opening modal:', err);
-      return res.sendStatus(500);
-    }
-  }
+  const payload = typeof req.body.payload === 'string' ? JSON.parse(req.body.payload) : req.body.payload;
 
   if (payload.type === 'view_submission' && payload.view.callback_id === 'submit_summary_modal') {
     const values = payload.view.state.values;
